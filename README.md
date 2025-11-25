@@ -1,4 +1,4 @@
-# ebs-unattached-automation
+# EBS-unattached-automation
 This Event Drive Architecture bypasses using AWS Config to detect unattached EBS Volumes that have not being attached to to an EC2 instance for 30 days and then it takes a snapshots of that unattached Volume and
 save that for 90 days retention windows. that way Volume can be stored at the lowest costing snapshot pricing and if not snapshot is not restored after 90 days, the snapshote deleted.
 Automating this using a Serverless environment give you the flexibility of retention of data at significant cost reduction. 
