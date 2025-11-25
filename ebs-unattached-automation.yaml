@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Monthly automation that snapshots and deletes unattached EBS volumes, then
+  deletes old snapshots beyond retention. One Lambda, one EventBridge rule.
+
+Parameters:
+  SnapshotRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Days to retain snapshots before cleanup.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 5 1 * ? *)" # 05:00 UTC on the 1st of every month
+    Description: EventBridge schedule to run the Lambda (cron or rate expression).
+
+  ExecutionRegions:
+    Type: CommaDelimitedList
+    Default: "us-east-2"
+    Description: Comma-separated AWS regions to operate in (e.g., us-east-1,us-east-2).
+
+  VolumeTagFilterKey:
+    Type: String
+    Default: ""
+    Description: Optional. Only act on unattached volumes that have this tag key (leave blank to ignore).
+
+  VolumeTagFilterValue:
+    Type: String
+    Default: ""
+    Description: Optional. If VolumeTagFilterKey is set, match this tag value (leave blank to match any value).
+
+  SnapshotTagKey:
+    Type: String
+    Default: "zotec:component"
+    Description: Tag key applied to created snapshots.
+
+  SnapshotTagValue:
+    Type: String
+    Default: "UnattachedVolume90daydelete"
+    Description: Tag value applied to created snapshots.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1,3,5,7,14,30,60,90,120,150,180,365,400,545,731,1827,3653]
+    Description: CloudWatch Logs retention for the Lambda log group.
+
+  DryRun:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, do not perform create/delete calls—only log intended actions.
+
+Resources:
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EBSUnattachedAutomationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DeleteVolume
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKeyWithoutPlainText
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:GrantIsForAWSResource: "true"
+
+  AutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ebs-unattached-automation-${AWS::StackName}"
+      Description: Snapshot & delete unattached EBS volumes; cleanup old snapshots.
+      Role: !GetAtt AutomationRole.Arn
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      Handler: index.handler
+      Environment:
+        Variables:
+          RETENTION_DAYS: !Ref SnapshotRetentionDays
+          SNAPSHOT_TAG_KEY: !Ref SnapshotTagKey
+          SNAPSHOT_TAG_VALUE: !Ref SnapshotTagValue
+          EXECUTION_REGIONS: !Join [",", !Ref ExecutionRegions]
+          VOLUME_TAG_FILTER_KEY: !Ref VolumeTagFilterKey
+          VOLUME_TAG_FILTER_VALUE: !Ref VolumeTagFilterValue
+          DRY_RUN: !Ref DryRun
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import botocore
+          from datetime import datetime, timezone, timedelta
+
+          RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
+          SNAPSHOT_TAG_KEY = os.environ.get("SNAPSHOT_TAG_KEY", "zotec:component")
+          SNAPSHOT_TAG_VALUE = os.environ.get("SNAPSHOT_TAG_VALUE", "UnattachedVolume90daydelete")
+          EXECUTION_REGIONS = [r.strip() for r in os.environ.get("EXECUTION_REGIONS", "").split(",") if r.strip()]
+          VOLUME_TAG_FILTER_KEY = os.environ.get("VOLUME_TAG_FILTER_KEY", "").strip()
+          VOLUME_TAG_FILTER_VALUE = os.environ.get("VOLUME_TAG_FILTER_VALUE", "").strip()
+          DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+          def log(msg, **kw):
+            print(msg, kw if kw else "")
+
+          def find_unattached_volumes(ec2):
+            filters = [{"Name": "status", "Values": ["available"]}]
+            if VOLUME_TAG_FILTER_KEY:
+              if VOLUME_TAG_FILTER_VALUE:
+                filters.append({"Name": f"tag:{VOLUME_TAG_FILTER_KEY}", "Values": [VOLUME_TAG_FILTER_VALUE]})
+              else:
+                filters.append({"Name": "tag-key", "Values": [VOLUME_TAG_FILTER_KEY]})
+
+            paginator = ec2.get_paginator("describe_volumes")
+            for page in paginator.paginate(Filters=filters):
+              for vol in page.get("Volumes", []):
+                yield vol
+
+          def create_snapshot_for_volume(ec2, volume):
+            vol_id = volume["VolumeId"]
+            desc = f"Snapshot for unattached volume {vol_id}"
+            if DRY_RUN:
+              log("DRY_RUN create snapshot", volume_id=vol_id, description=desc)
+              return None
+            resp = ec2.create_snapshot(VolumeId=vol_id, Description=desc)
+            snap_id = resp["SnapshotId"]
+            ec2.create_tags(Resources=[snap_id], Tags=[{"Key": SNAPSHOT_TAG_KEY, "Value": SNAPSHOT_TAG_VALUE}])
+            log("Created snapshot", snapshot_id=snap_id, volume_id=vol_id)
+            return snap_id
+
+          def delete_volume(ec2, volume_id):
+            if DRY_RUN:
+              log("DRY_RUN delete volume", volume_id=volume_id)
+              return
+            ec2.delete_volume(VolumeId=volume_id)
+            log("Deleted volume", volume_id=volume_id)
+
+          def cleanup_old_snapshots(ec2):
+            cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+            paginator = ec2.get_paginator("describe_snapshots")
+            filters = [{"Name": f"tag:{SNAPSHOT_TAG_KEY}", "Values": [SNAPSHOT_TAG_VALUE]}]
+            for page in paginator.paginate(OwnerIds=["self"], Filters=filters):
+              for snap in page.get("Snapshots", []):
+                start_time = snap["StartTime"]
+                snap_id = snap["SnapshotId"]
+                if start_time < cutoff:
+                  if DRY_RUN:
+                    log("DRY_RUN delete snapshot", snapshot_id=snap_id, start=str(start_time))
+                    continue
+                  try:
+                    ec2.delete_snapshot(SnapshotId=snap_id)
+                    log("Deleted old snapshot", snapshot_id=snap_id, start=str(start_time))
+                  except botocore.exceptions.ClientError as e:
+                    log("Failed to delete snapshot", snapshot_id=snap_id, error=str(e))
+
+          def process_region(region):
+            log("Processing region", region=region)
+            ec2 = boto3.client("ec2", region_name=region)
+
+            for vol in find_unattached_volumes(ec2):
+              vol_id = vol["VolumeId"]
+              try:
+                create_snapshot_for_volume(ec2, vol)
+              except botocore.exceptions.ClientError as e:
+                log("Failed to create snapshot", volume_id=vol_id, error=str(e))
+                continue
+              try:
+                delete_volume(ec2, vol_id)
+              except botocore.exceptions.ClientError as e:
+                log("Failed to delete volume", volume_id=vol_id, error=str(e))
+
+            cleanup_old_snapshots(ec2)
+
+          def handler(event, context):
+            if not EXECUTION_REGIONS:
+              current_region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+              if current_region:
+                process_region(current_region)
+              else:
+                log("No region specified and no default region found; nothing to do.")
+              return {"ok": True}
+
+            for region in EXECUTION_REGIONS:
+              try:
+                process_region(region)
+              except Exception as e:
+                log("Region processing failed", region=region, error=str(e))
+            return {"ok": True}
+
+  AutomationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AutomationFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  MonthlyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ebs-unattached-monthly-${AWS::StackName}"
+      Description: Triggers the automation Lambda on the specified schedule.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutomationFunction.Arn
+          Id: "AutomationFunctionTarget"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function.
+    Value: !Ref AutomationFunction
+  EventRuleArn:
+    Description: ARN of the EventBridge rule.
+    Value: !GetAtt MonthlyRule.Arn
